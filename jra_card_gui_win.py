@@ -352,7 +352,7 @@ def fetch_rows_and_meta(url: str, soup: BeautifulSoup | None = None):
     return rows, filename, race_title, url
 
 def save_to_desktop(rows, filename, race_title):
-    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    desktop = os.path.join(os.path.expanduser("~"), "デスクトップ")
     os.makedirs(desktop, exist_ok=True)
     path = os.path.join(desktop, filename)
 
