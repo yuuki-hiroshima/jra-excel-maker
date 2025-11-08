@@ -1,8 +1,8 @@
-# v0.7 (Calendar popup always)
+# v0.14 (改善版：複数アプローチ併用)
 import os, re, threading
-from datetime import datetime
+from datetime import datetime, timedelta
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, scrolledtext
 
 import requests
 from bs4 import BeautifulSoup
@@ -10,7 +10,7 @@ from bs4.element import Tag
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Border, Side, Alignment
 
-# --- tkcalendar の有無を判定（あるなら使う） ---
+# tkcalendar は任意（ある場合はポップアップカレンダー使用）
 TKCAL_OK = True
 try:
     from tkcalendar import DateEntry, Calendar
@@ -18,8 +18,13 @@ except Exception:
     TKCAL_OK = False
 
 VENUES = ["札幌","函館","福島","新潟","東京","中山","中京","京都","阪神","小倉"]
+VENUE_CODE = {
+    "札幌":"01","函館":"02","福島":"03","新潟":"04",
+    "東京":"05","中山":"06","中京":"07","京都":"08",
+    "阪神":"09","小倉":"10",
+}
 
-# ================= ユーティリティ =================
+# ================== HTMLユーティリティ ==================
 def anchor_text(cell: Tag) -> str:
     if hasattr(cell, "find"):
         a = cell.find("a")
@@ -35,15 +40,12 @@ def clean_name(s: str) -> str:
     return s.strip()
 
 def find_col_index(header_map: dict, candidates) -> int | None:
-    # 完全一致→部分一致の順で検索
     for key in candidates:
         for h, idx in header_map.items():
-            if h == key:
-                return idx
+            if h == key: return idx
     for key in candidates:
         for h, idx in header_map.items():
-            if key in h:
-                return idx
+            if key in h: return idx
     return None
 
 def find_table_and_headers(soup: BeautifulSoup):
@@ -62,36 +64,246 @@ def find_table_and_headers(soup: BeautifulSoup):
 
 def extract_basic_meta(text_all: str):
     m_date = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", text_all)
-    if m_date:
-        y, mo, d = map(int, m_date.groups())
-        ymd = f"{y:04d}{mo:02d}{d:02d}"
-    else:
-        ymd = datetime.now().strftime("%Y%m%d")
-
-    # 例：「4回京都1日」から場所のみ抽出
+    ymd = f"{int(m_date.group(1)):04d}{int(m_date.group(2)):02d}{int(m_date.group(3)):02d}" if m_date else datetime.now().strftime("%Y%m%d")
     m_place = re.search(r"\d+\s*回\s*(札幌|函館|福島|新潟|東京|中山|中京|京都|阪神|小倉)\s*\d+\s*日", text_all)
     place = m_place.group(1) if m_place else "不明"
-
     m_r1 = re.search(r"(\d{1,2})\s*レース", text_all)
     m_r2 = re.search(r"(\d{1,2})\s*R", text_all)
-    if m_r1:
-        race_no = f"{int(m_r1.group(1))}R"
-    elif m_r2:
-        race_no = f"{int(m_r2.group(1))}R"
-    else:
-        race_no = "R"
+    race_no = f"{int((m_r1 or m_r2).group(1))}R" if (m_r1 or m_r2) else "R"
     return ymd, place, race_no
 
-# ================= HTML 抽出 =================
-def fetch_rows_and_meta_by_url(target_url: str):
-    r = requests.get(target_url, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
-    r.raise_for_status()
+# ================== URL探索（複数戦略） ==================
+def try_fetch(url: str, debug_log=None):
+    """URLからHTMLを取得し、出馬表として有効か判定"""
+    try:
+        r = requests.get(url, headers={
+            "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }, timeout=8)
+        if debug_log:
+            debug_log(f"試行: {url[:90]}... → {r.status_code}")
+    except Exception as e:
+        if debug_log:
+            debug_log(f"接続失敗: {str(e)[:50]}")
+        return None
+    
+    if r.status_code != 200:
+        return None
+    
     r.encoding = r.apparent_encoding
     soup = BeautifulSoup(r.text, "lxml")
+    
+    # 出馬表ページの特徴をチェック
+    table, _, _ = find_table_and_headers(soup)
+    if not table:
+        return None
+    
+    # レース名要素の存在確認
+    race_name = soup.select_one(".race_name") or soup.find(string=re.compile(r"\d+回.*(札幌|函館|福島|新潟|東京|中山|中京|京都|阪神|小倉)"))
+    if not race_name:
+        return None
+    
+    if debug_log:
+        debug_log(f"  ✓ 有効な出馬表ページを検出！")
+    return soup
+
+def strategy_1_pattern_analysis(yyyymmdd: str, place: str, race_no: int, debug_log=None):
+    """
+    戦略1: 提供されたURLパターンの分析
+    pw01dde01 05 20250501 11 20251108 /EB
+            場所 開催日   R# 今日の日付
+    
+    サフィックスの規則性を探る
+    """
+    code = VENUE_CODE.get(place)
+    if not code:
+        return None, None
+    
+    if debug_log:
+        debug_log("【戦略1】パターン分析による推測")
+    
+    # 今日の日付とその前後
+    today = datetime.now()
+    access_dates = [
+        today.strftime("%Y%m%d"),
+        (today + timedelta(days=1)).strftime("%Y%m%d"),
+        (today - timedelta(days=1)).strftime("%Y%m%d"),
+    ]
+    
+    # 観測されたサフィックスとその周辺
+    # EB=235, 39=57, 1B=27 (16進数→10進数)
+    # これらから規則性を推測
+    suffixes = ["EB", "39", "1B", "E9", "EA", "EC", "37", "38", "3A", "19", "1A", "1C", "1D"]
+    
+    race_variants = [f"{race_no:02d}", f"{race_no}"]
+    endpoints = ["accessD.html", "accessS.html"]
+    
+    tried = 0
+    for endpoint in endpoints:
+        for rn in race_variants:
+            for access_date in access_dates:
+                for suffix in suffixes:
+                    cname = f"pw01dde{code}{yyyymmdd}{rn}{access_date}/{suffix}"
+                    url = f"https://www.jra.go.jp/JRADB/{endpoint}?CNAME={cname}"
+                    tried += 1
+                    
+                    soup = try_fetch(url, debug_log)
+                    if soup:
+                        return url, soup
+                    
+                    if tried > 50:
+                        return None, None
+    
+    return None, None
+
+def strategy_2_date_variations(yyyymmdd: str, place: str, race_no: int, debug_log=None):
+    """
+    戦略2: 日付バリエーション探索
+    開催日と回数の組み合わせパターン
+    """
+    code = VENUE_CODE.get(place)
+    if not code:
+        return None, None
+    
+    if debug_log:
+        debug_log("【戦略2】日付バリエーション探索")
+    
+    # 開催日の前後も試す（週末開催などの可能性）
+    dt = datetime.strptime(yyyymmdd, "%Y%m%d")
+    race_dates = [
+        dt.strftime("%Y%m%d"),
+        (dt - timedelta(days=1)).strftime("%Y%m%d"),
+        (dt + timedelta(days=1)).strftime("%Y%m%d"),
+    ]
+    
+    today = datetime.now().strftime("%Y%m%d")
+    race_variants = [f"{race_no:02d}", f"{race_no}"]
+    
+    # より広範囲のサフィックス
+    for i in range(256):
+        suffix = f"{i:02X}"
+        for race_date in race_dates:
+            for rn in race_variants:
+                cname = f"pw01dde{code}{race_date}{rn}{today}/{suffix}"
+                url = f"https://www.jra.go.jp/JRADB/accessD.html?CNAME={cname}"
+                
+                soup = try_fetch(url, debug_log)
+                if soup:
+                    return url, soup
+                
+                # 20件試して見つからなければ次の日付へ
+                if i > 20:
+                    break
+    
+    return None, None
+
+def strategy_3_scrape_pages(yyyymmdd: str, place: str, race_no: int, debug_log=None):
+    """
+    戦略3: JRAページから全リンクを抽出
+    """
+    if debug_log:
+        debug_log("【戦略3】JRAページからリンク抽出")
+    
+    urls_to_scrape = [
+        f"https://www.jra.go.jp/keiba/thisweek/",
+        f"https://www.jra.go.jp/keiba/thisweek/{yyyymmdd}/",
+        f"https://www.jra.go.jp/",
+    ]
+    
+    all_links = set()
+    
+    for page_url in urls_to_scrape:
+        try:
+            if debug_log:
+                debug_log(f"ページ取得: {page_url}")
+            
+            r = requests.get(page_url, headers={
+                "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }, timeout=10)
+            
+            if r.status_code != 200:
+                continue
+            
+            r.encoding = r.apparent_encoding
+            soup = BeautifulSoup(r.text, "lxml")
+            
+            # すべてのリンクとonClickを抽出
+            for elem in soup.find_all(["a", "button", "div", "span"]):
+                # href属性
+                href = elem.get("href", "")
+                if "JRADB" in href and "CNAME" in href:
+                    all_links.add(href if href.startswith("http") else f"https://www.jra.go.jp{href}")
+                
+                # onClick属性からCNAME抽出
+                onclick = elem.get("onclick", "")
+                match = re.search(r"CNAME=([^'\"&\s]+)", onclick)
+                if match:
+                    cname = match.group(1)
+                    url = f"https://www.jra.go.jp/JRADB/accessD.html?CNAME={cname}"
+                    all_links.add(url)
+            
+            if debug_log:
+                debug_log(f"  {len(all_links)}個のJRADBリンクを発見")
+        
+        except Exception as e:
+            if debug_log:
+                debug_log(f"ページ取得エラー: {e}")
+    
+    # 抽出したリンクを試行
+    code = VENUE_CODE.get(place)
+    for url in all_links:
+        # 場所コードとレース番号を含むURLを優先
+        if code in url or str(race_no) in url or f"{race_no:02d}" in url:
+            if debug_log:
+                debug_log(f"候補リンクを検証: {url[:80]}...")
+            soup = try_fetch(url, debug_log)
+            if soup:
+                # 本当に該当レースか確認
+                text = soup.get_text()
+                if place in text and (f"{race_no}R" in text or f"{race_no}レース" in text):
+                    return url, soup
+    
+    return None, None
+
+def build_jra_url_and_soup(yyyymmdd: str, place: str, race_no: int, status_cb=None, debug_log=None):
+    """複数の戦略を順次試行"""
+    
+    strategies = [
+        ("パターン分析", strategy_1_pattern_analysis),
+        ("日付バリエーション", strategy_2_date_variations),
+        ("ページスクレイピング", strategy_3_scrape_pages),
+    ]
+    
+    for name, strategy in strategies:
+        if status_cb:
+            status_cb(f"{name}で探索中...")
+        if debug_log:
+            debug_log(f"\n{'='*60}")
+            debug_log(f"戦略: {name}")
+            debug_log(f"{'='*60}")
+        
+        try:
+            url, soup = strategy(yyyymmdd, place, race_no, debug_log)
+            if url and soup:
+                if debug_log:
+                    debug_log(f"\n✓ 成功！ URL発見: {url}")
+                return url, soup
+        except Exception as e:
+            if debug_log:
+                debug_log(f"戦略失敗: {e}")
+    
+    return None, None
+
+# ================== 抽出＆Excel ==================
+def fetch_rows_and_meta(url: str, soup: BeautifulSoup | None = None):
+    if soup is None:
+        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
+        r.raise_for_status()
+        r.encoding = r.apparent_encoding
+        soup = BeautifulSoup(r.text, "lxml")
 
     table, _, header_map = find_table_and_headers(soup)
     if not table:
-        raise RuntimeError("出馬表テーブル（『馬名』『騎手』ヘッダー）が見つかりません。URLをご確認ください。")
+        raise RuntimeError("出馬表テーブル（『馬名』『騎手』ヘッダー）が見つかりません。")
 
     col_umaban = find_col_index(header_map, ["馬番","馬番号"])
     col_horse  = find_col_index(header_map, ["馬名"])
@@ -115,34 +327,30 @@ def fetch_rows_and_meta_by_url(target_url: str):
         if not jockey or jockey == "-":
             continue
 
-        # 馬番
         umaban = ""
         if col_umaban is not None and len(tds) > col_umaban:
             m = re.search(r"\d{1,2}", anchor_text(tds[col_umaban]).strip())
-            if m: umaban = m.group(0)
+            umaban = m.group(0) if m else ""
         else:
             m = re.match(r"\D*(\d{1,2})\D*", anchor_text(tds[0]) if tds else "")
-            if m: umaban = m.group(1)
+            umaban = m.group(1) if m else ""
 
         rows.append((umaban, horse, jockey))
 
     if not rows:
         raise RuntimeError("馬番／馬名／騎手名の抽出結果が空でした。")
 
-    # レース名：.race_name を最優先
     race_el = soup.select_one(".race_name")
     race_title = race_el.get_text(strip=True).split("|")[0].strip() if race_el else ""
 
     text_all = soup.get_text(" ", strip=True)
     ymd, place, race_no = extract_basic_meta(text_all)
-
     if not race_title:
         race_title = f"{place}{race_no}"
 
     filename = f"{ymd}_{place}_{race_no}.xlsx"
-    return rows, filename, race_title
+    return rows, filename, race_title, url
 
-# ================= Excel 出力 =================
 def save_to_desktop(rows, filename, race_title):
     desktop = os.path.join(os.path.expanduser("~"), "Desktop")
     os.makedirs(desktop, exist_ok=True)
@@ -152,21 +360,17 @@ def save_to_desktop(rows, filename, race_title):
     ws = wb.active
     ws.title = "出馬表"
 
-    # レース名（上部結合）
     ws.merge_cells("A1:E1")
-    title_cell = ws["A1"]
-    title_cell.value = race_title
-    title_cell.alignment = Alignment(horizontal="center", vertical="center")
-    title_cell.font = Font(bold=True, size=18)
-    title_cell.fill = PatternFill(start_color="FADADD", end_color="FADADD", fill_type="solid")
+    t = ws["A1"]; t.value = race_title
+    t.alignment = Alignment(horizontal="center", vertical="center")
+    t.font = Font(bold=True, size=18)
+    t.fill = PatternFill(start_color="FADADD", end_color="FADADD", fill_type="solid")
     ws.row_dimensions[1].height = 30
 
-    # ヘッダーとデータ
     ws.append(["馬番","馬名","騎手名","評価","短評"])
     for umaban, horse, jockey in rows:
         ws.append([umaban, horse, jockey, "", ""])
 
-    # 体裁
     light_blue = PatternFill(start_color="CCFFFF", end_color="CCFFFF", fill_type="solid")
     bold = Font(bold=True)
     thin = Side(style="thin", color="000000")
@@ -193,20 +397,14 @@ def save_to_desktop(rows, filename, race_title):
     wb.save(path)
     return path
 
-def build_jra_url(yyyymmdd: str, place: str, race_no: int) -> str | None:
-    # URL自動生成は不安定なため未実装。URL直入れ運用を推奨。
-    return None
-
-# ================= GUI =================
+# ================== GUI ==================
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("JRA出馬表 取り込みツール（Excel出力） - v0.7")
-        self.geometry("660x310")
-        self.resizable(False, False)
+        self.title("JRA出馬表 取り込みツール（3戦略併用版） - v0.14")
+        self.geometry("750x550"); self.resizable(True, True)
 
-        frm = ttk.Frame(self, padding=12)
-        frm.pack(fill="both", expand=True)
+        frm = ttk.Frame(self, padding=12); frm.pack(fill="both", expand=True)
 
         row = 0
         ttk.Label(frm, text="取得方法").grid(row=row, column=0, sticky="w")
@@ -216,150 +414,142 @@ class App(tk.Tk):
 
         row += 1
         ttk.Label(frm, text="日付").grid(row=row, column=0, sticky="e", pady=6)
-
-        # DateEntry が使える環境でも、▼は環境により開かないことがある。
-        # ここでは値の保持のみ任せ、実際の選択は常に📅ボタンでポップアップを出す。
         if TKCAL_OK:
             self.date_widget = DateEntry(frm, width=14, date_pattern="yyyyMMdd")
         else:
             self.date_widget = ttk.Entry(frm, width=16)
             self.date_widget.insert(0, datetime.now().strftime("%Y%m%d"))
         self.date_widget.grid(row=row, column=1, sticky="w", pady=6)
-
-        self.cal_btn = ttk.Button(frm, text="📅", width=3, command=self.open_calendar)
-        self.cal_btn.grid(row=row, column=2, sticky="w")
+        self.cal_btn = ttk.Button(frm, text="📅", width=3, command=self.open_calendar); self.cal_btn.grid(row=row, column=2, sticky="w")
 
         ttk.Label(frm, text="場所").grid(row=row, column=3, sticky="e")
-        self.cmb_place = ttk.Combobox(frm, values=VENUES, width=8, state="readonly")
-        self.cmb_place.grid(row=row, column=4, sticky="w")
-        self.cmb_place.set("京都")
+        self.cmb_place = ttk.Combobox(frm, values=VENUES, width=8, state="readonly"); self.cmb_place.grid(row=row, column=4, sticky="w"); self.cmb_place.set("京都")
 
         row += 1
         ttk.Label(frm, text="レース").grid(row=row, column=0, sticky="e")
-        self.cmb_race = ttk.Combobox(frm, values=[f"{i}R" for i in range(1,13)], width=6, state="readonly")
-        self.cmb_race.grid(row=row, column=1, sticky="w")
-        self.cmb_race.set("11R")
+        self.cmb_race = ttk.Combobox(frm, values=[f"{i}R" for i in range(1,13)], width=6, state="readonly"); self.cmb_race.grid(row=row, column=1, sticky="w"); self.cmb_race.set("11R")
 
         row += 1
         ttk.Label(frm, text="URL（任意：直入力する場合）").grid(row=row, column=0, sticky="e")
-        self.ent_url = ttk.Entry(frm, width=52)
-        self.ent_url.grid(row=row, column=1, columnspan=4, sticky="w")
+        self.ent_url = ttk.Entry(frm, width=56); self.ent_url.grid(row=row, column=1, columnspan=4, sticky="ew")
 
         row += 1
-        self.btn = ttk.Button(frm, text="Excelを作成（デスクトップに保存）", command=self.run_fetch)
-        self.btn.grid(row=row, column=0, columnspan=5, sticky="ew", pady=12)
+        self.btn = ttk.Button(frm, text="Excelを作成（デスクトップに保存）", command=self.run_fetch); self.btn.grid(row=row, column=0, columnspan=5, sticky="ew", pady=12)
 
         row += 1
-        self.status = ttk.Label(frm, text=f"待機中 / Calendar module: {'ON' if TKCAL_OK else 'OFF (fallback)'}")
-        self.status.grid(row=row, column=0, columnspan=5, sticky="w")
+        self.status = ttk.Label(frm, text=f"待機中 / 方式: 3戦略併用 / Calendar: {'ON' if TKCAL_OK else 'OFF'}"); self.status.grid(row=row, column=0, columnspan=5, sticky="w")
 
-        for i in range(5):
-            frm.columnconfigure(i, weight=1)
+        row += 1
+        ttk.Label(frm, text="デバッグログ (URLが見つかったら、次回用にメモしてください):").grid(row=row, column=0, columnspan=5, sticky="w", pady=(10,0))
+        
+        row += 1
+        self.debug_text = scrolledtext.ScrolledText(frm, height=12, width=80, state="disabled")
+        self.debug_text.grid(row=row, column=0, columnspan=5, sticky="nsew", pady=5)
 
-    # ---- ここが確実に開くカレンダー ----
+        frm.rowconfigure(row, weight=1)
+        for i in range(5): frm.columnconfigure(i, weight=1)
+
+    def debug_log(self, msg):
+        """デバッグログに追記"""
+        self.after(0, lambda: self._append_debug(msg))
+    
+    def _append_debug(self, msg):
+        self.debug_text.config(state="normal")
+        self.debug_text.insert(tk.END, msg + "\n")
+        self.debug_text.see(tk.END)
+        self.debug_text.config(state="disabled")
+
     def open_calendar(self):
-        """📅を押したら必ず大きなカレンダーを表示して日付を確定する。"""
         if not TKCAL_OK:
-            # フォールバック：簡易入力ダイアログ
-            top = tk.Toplevel(self)
-            top.title("日付を入力（YYYYMMDD）")
-            top.resizable(False, False)
+            top = tk.Toplevel(self); top.title("日付を入力（YYYYMMDD）"); top.resizable(False, False)
             ttk.Label(top, text="tkcalendar が見つかりません。\nYYYYMMDD 形式で入力してください。").pack(padx=10, pady=10)
-            ent = ttk.Entry(top)
-            ent.insert(0, self._current_ymd_or_today())
-            ent.pack(padx=10, pady=6)
-
-            def set_date_fallback():
-                self.set_date_value(ent.get().strip())
-                top.destroy()
-            ttk.Button(top, text="この日付で決定", command=set_date_fallback).pack(pady=8)
+            ent = ttk.Entry(top); ent.insert(0, self._current_ymd_or_today()); ent.pack(padx=10, pady=6)
+            ttk.Button(top, text="この日付で決定", command=lambda: (self.set_date_value(ent.get().strip()), top.destroy())).pack(pady=8)
             return
-
-        # tkcalendar が使えるときは Calendar を Toplevel で出す
-        cur = self._current_ymd_or_today()
-        init_year, init_mon, init_day = int(cur[:4]), int(cur[4:6]), int(cur[6:8])
-
-        top = tk.Toplevel(self)
-        top.title("日付を選択")
-        top.resizable(False, False)
-
-        # Calendar は 'yyyy-mm-dd' 形式を返す
-        cal = Calendar(top, year=init_year, month=init_mon, day=init_day, date_pattern="yyyy-mm-dd")
-        cal.pack(padx=10, pady=10)
-
-        def set_date():
-            s = cal.get_date()    # 'YYYY-MM-DD'
-            self.set_date_value(s.replace("-", ""))
-            top.destroy()
-
-        ttk.Button(top, text="この日付で決定", command=set_date).pack(pady=8)
+        cur = self._current_ymd_or_today(); y, m, d = int(cur[:4]), int(cur[4:6]), int(cur[6:8])
+        top = tk.Toplevel(self); top.title("日付を選択"); top.resizable(False, False)
+        cal = Calendar(top, year=y, month=m, day=d, date_pattern="yyyy-mm-dd"); cal.pack(padx=10, pady=10)
+        ttk.Button(top, text="この日付で決定", command=lambda: (self.set_date_value(cal.get_date().replace("-", "")), top.destroy())).pack(pady=8)
 
     def _current_ymd_or_today(self) -> str:
         try:
             cur = self.date_widget.get().strip()
-            if re.fullmatch(r"\d{8}", cur):
-                return cur
+            if re.fullmatch(r"\d{8}", cur): return cur
         except Exception:
             pass
         return datetime.now().strftime("%Y%m%d")
 
     def set_date_value(self, ymd: str):
         if re.fullmatch(r"\d{8}", ymd):
-            if hasattr(self.date_widget, "delete"):
-                self.date_widget.delete(0, tk.END)
-            if hasattr(self.date_widget, "insert"):
-                self.date_widget.insert(0, ymd)
+            if hasattr(self.date_widget, "delete"): self.date_widget.delete(0, tk.END)
+            if hasattr(self.date_widget, "insert"): self.date_widget.insert(0, ymd)
         else:
             messagebox.showwarning("日付形式エラー", "YYYYMMDD で入力してください。")
 
-    # ---- 実行 ----
     def run_fetch(self):
+        # デバッグログをクリア
+        self.debug_text.config(state="normal")
+        self.debug_text.delete(1.0, tk.END)
+        self.debug_text.config(state="disabled")
+        
         mode = self.mode.get()
-        url = self.ent_url.get().strip()
+        url_manual = self.ent_url.get().strip()
 
-        if mode == "url":
-            if not url:
-                messagebox.showwarning("入力不足", "URLを入力してください。")
-                return
-            target_url = url
-        else:
-            ymd = self._current_ymd_or_today()
-            place = self.cmb_place.get().strip()
-            race = self.cmb_race.get().strip()
+        if mode == "url" and url_manual:
+            self._start_job(url_manual, soup=None)
+            return
 
-            if not (re.fullmatch(r"\d{8}", ymd) and place in VENUES and re.fullmatch(r"\d{1,2}R", race)):
-                messagebox.showwarning("入力値エラー", "日付はカレンダーで選択、場所はリストから、レースは1R〜12Rを選択してください。")
-                return
+        ymd = self._current_ymd_or_today()
+        place = self.cmb_place.get().strip()
+        race = self.cmb_race.get().strip()
 
-            built = build_jra_url(ymd, place, int(race[:-1]))
-            if built:
-                target_url = built
-            else:
-                if not url:
-                    messagebox.showinfo("URL案内", "JRA公式の出馬表ページURLをコピーして、上のURL欄へ貼り付けてください。")
-                    return
-                target_url = url
+        if not (re.fullmatch(r"\d{8}", ymd) and place in VENUES and re.fullmatch(r"\d{1,2}R", race)):
+            messagebox.showwarning("入力値エラー", "日付はカレンダーで選択、場所はリストから、レースは1R〜12Rを選択してください。")
+            return
 
-        self.btn.config(state="disabled")
-        self.status.config(text="取得中…")
-        threading.Thread(target=self._do_fetch, args=(target_url,), daemon=True).start()
+        rno = int(race[:-1])
+        self.btn.config(state="disabled"); self.status.config(text="3つの戦略で探索中...")
+        self.debug_log(f"探索開始: {ymd} {place} {rno}R")
+        self.debug_log("戦略1→戦略2→戦略3の順で試行します\n")
+        threading.Thread(target=self._auto_and_fetch, args=(ymd, place, rno), daemon=True).start()
 
-    def _do_fetch(self, target_url: str):
+    def _auto_and_fetch(self, ymd, place, rno):
         try:
-            rows, filename, race_title = fetch_rows_and_meta_by_url(target_url)
+            url, soup = build_jra_url_and_soup(
+                ymd, place, rno, 
+                status_cb=lambda s: self.after(0, lambda: self.status.config(text=s)),
+                debug_log=self.debug_log
+            )
+            if not url:
+                self._done("該当するレースのURLが見つかりませんでした。\n\n【推奨】JRA公式サイトで該当レースのURLをコピーし、\n上部の「URL（任意）」欄に貼り付けて実行してください。")
+                return
+            rows, filename, race_title, used_url = fetch_rows_and_meta(url, soup)
             out = save_to_desktop(rows, filename, race_title)
-            self._done(f"保存完了：{out}")
+            self._done(f"保存完了：{out}\n\n使用URL（次回用にメモ推奨）：\n{used_url}")
         except Exception as e:
             self._done(f"エラー：{e}")
 
-    def _done(self, msg: str):
+    def _start_job(self, url, soup=None):
+        self.btn.config(state="disabled"); self.status.config(text="取得中…")
+        self.debug_log(f"URL直接取得: {url}")
+        threading.Thread(target=self._do_fetch, args=(url, soup), daemon=True).start()
+
+    def _do_fetch(self, url, soup):
+        try:
+            rows, filename, race_title, used_url = fetch_rows_and_meta(url, soup)
+            out = save_to_desktop(rows, filename, race_title)
+            self._done(f"保存完了：{out}\n使用URL：{used_url}")
+        except Exception as e:
+            self._done(f"エラー：{e}")
+
+    def _done(self, msg):
         self.after(0, lambda: self._finish_ui(msg))
 
-    def _finish_ui(self, msg: str):
-        self.btn.config(state="normal")
-        self.status.config(text=msg)
-        (messagebox.showinfo if msg.startswith("保存完了") else messagebox.showerror)("結果", msg)
+    def _finish_ui(self, msg):
+        self.btn.config(state="normal"); self.status.config(text=msg.splitlines()[0])
+        self.debug_log(f"\n{'='*60}\n{msg}\n{'='*60}")
+        (messagebox.showinfo if msg.startswith("保存完了") else messagebox.showwarning)("結果", msg)
 
-# ================= main =================
+# ---------------- main ----------------
 if __name__ == "__main__":
     App().mainloop()
